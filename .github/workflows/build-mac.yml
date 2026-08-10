@@ -16,22 +16,36 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15 # arm64, free and unlimited on public repos
+    runs-on: macos-26 # arm64, free and unlimited on public repos
     timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v4
 
-      # The runner ships ~14 GB free. Spare Xcodes and simulator runtimes are
-      # the cheapest space to reclaim. Every step prints df, so a disk failure
-      # says exactly where it happened instead of leaving us guessing.
-      - name: Free disk space
+      # Ghostty main builds against the macOS 26 SDK, and the runner's default
+      # Xcode selection can be older (a macos-15 image selects 16.4, which fails
+      # compiling the Swift targets). Pick the newest Xcode explicitly and only
+      # then delete the others — deleting first throws away the one we needed.
+      #
+      # Spare Xcodes and simulator runtimes are the cheapest space to reclaim on
+      # a runner with ~14 GB free. Every step prints df, so a disk failure says
+      # exactly where it happened instead of leaving us guessing.
+      - name: Select Xcode and free disk space
         run: |
           df -h / | tail -1
-          KEEP=$(xcode-select -p | sed 's|/Contents/Developer||')
-          echo "keeping $KEEP"
+          ls -d /Applications/Xcode*.app || true
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$NEWEST" ] || { echo "no Xcode on this runner"; exit 1; }
+          echo "selecting $NEWEST"
+          sudo xcode-select -s "$NEWEST/Contents/Developer"
+          xcodebuild -version
+          MAJOR=$(xcodebuild -version | sed -n '1s/Xcode \([0-9]*\).*/\1/p')
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "Xcode $MAJOR is too old; Ghostty main needs the macOS 26 SDK." >&2
+            exit 1
+          fi
           for app in /Applications/Xcode*.app; do
-            [ "$app" = "$KEEP" ] || sudo rm -rf "$app"
+            [ "$app" = "$NEWEST" ] || sudo rm -rf "$app"
           done
           sudo rm -rf ~/Library/Developer/CoreSimulator/Profiles/Runtimes
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes
