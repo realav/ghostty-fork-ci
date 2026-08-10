@@ -90,9 +90,14 @@ The workflow's scheduled run follows upstream `main`. If upstream drifts far
 enough that `git am` fails, the build fails loudly — that's the signal to
 refresh:
 
-1. In the local fork (`~/ghostty`), `./custom/rebase.sh` to rebase `custom` onto
-   upstream and resolve conflicts.
-2. `./local/make-patches.sh` here to re-export.
-3. Commit and push.
+```sh
+./local/refresh-patches.sh          # rebase onto upstream main
+./local/refresh-patches.sh <ref>    # or onto a specific ref
+```
 
-A local fork checkout is only needed for that. It is otherwise disposable.
+It clones upstream into a temp directory, replays the patches, rebases, and
+writes `patches/` and `.fork-base` back. No persistent fork checkout is needed —
+this repo is self-contained. On a conflict the clone is kept and the script
+prints how to finish by hand.
+
+Then commit, push, and run the workflow to confirm it still builds.
