@@ -1,0 +1,183 @@
+From e5d4ee6c06f1a73552ed8d334c92d1b47adafa41 Mon Sep 17 00:00:00 2001
+From: Aman <3285444+realav@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 14:01:39 +0530
+Subject: [PATCH 3/3] feat: smooth (sub-cell) trackpad scrolling
+
+Ported from ghostty-org/ghostty#3206. Upstream has no native support and
+the original request (#2355) was closed as not directly actionable.
+
+Ghostty computes the sub-cell remainder of a precision scroll and then
+discards it: `poff - (poff / cell_size) * cell_size` is always zero
+because the division isn't truncated first. Truncating keeps the
+remainder, which is exposed to custom shaders as `iPendingScroll` so the
+frame can be shifted by it.
+
+Deviation from the original patch: it read live terminal state (mouse
+event mode, scrollback boundaries) from inside the renderer, which runs
+on its own thread. That logic now runs in scrollCallback on the app
+thread under the renderer lock, and the render thread only reads a single
+scalar.
+
+Inert unless `custom-shader` is set. Known limitations are documented in
+custom/README.md.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/Surface.zig                            | 43 +++++++++++++++++++---
+ src/renderer/generic.zig                   | 12 ++++++
+ src/renderer/shaders/shadertoy_prefix.glsl |  1 +
+ src/renderer/shadertoy.zig                 |  2 +
+ src/terminal/PageList.zig                  |  2 +-
+ 5 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index a25d76d0f..41498dddd 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -242,6 +242,18 @@ const Mouse = struct {
+     pending_scroll_x: f64 = 0,
+     pending_scroll_y: f64 = 0,
+ 
++    /// The sub-cell scroll offset the renderer should shift the viewport by,
++    /// for smooth (sub-cell) trackpad scrolling. This is `pending_scroll_y`
++    /// clamped to zero in the cases where shifting would look wrong: when the
++    /// terminal application is consuming scroll events itself, and at the top
++    /// and bottom of the scrollback where there is no further content to
++    /// reveal.
++    ///
++    /// This is computed on the app thread (where the terminal can be read
++    /// under lock) rather than in the renderer, so the render thread only ever
++    /// reads this one scalar.
++    smooth_scroll_y: f64 = 0,
++
+     /// True if the mouse is hidden
+     hidden: bool = false,
+ 
+@@ -3523,13 +3535,12 @@ pub fn scrollCallback(
+             break :y .{};
+         }
+ 
+-        // We scroll by the number of rows in the offset and save the remainder
+-        const amount = poff / cell_size;
++        // We scroll by the number of rows in the offset, rounded towards zero and save the remainder
++        const amount: f64 = @trunc(poff / cell_size);
+         assert(@abs(amount) >= 1);
+         self.mouse.pending_scroll_y = poff - (amount * cell_size);
+ 
+-        // Round towards zero.
+-        const delta: isize = @intFromFloat(@trunc(amount));
++        const delta: isize = @intFromFloat(amount);
+         assert(@abs(delta) >= 1);
+ 
+         break :y .{ .delta = delta };
+@@ -3549,10 +3560,10 @@ pub fn scrollCallback(
+             break :x .{};
+         }
+ 
+-        const amount = poff / cell_size;
++        const amount: f64 = @trunc(poff / cell_size);
+         assert(@abs(amount) >= 1);
+         self.mouse.pending_scroll_x = poff - (amount * cell_size);
+-        const delta: isize = @intFromFloat(@trunc(amount));
++        const delta: isize = @intFromFloat(amount);
+         assert(@abs(delta) >= 1);
+         break :x .{ .delta = delta };
+     };
+@@ -3570,6 +3581,26 @@ pub fn scrollCallback(
+             try self.setSelection(null);
+         }
+ 
++        // Recompute the sub-cell offset the renderer should apply. We're
++        // under the renderer lock here, so reading terminal state is safe.
++        self.mouse.smooth_scroll_y = offset: {
++            const pending = self.mouse.pending_scroll_y;
++            if (pending == 0) break :offset 0;
++
++            // The application is handling scroll itself (e.g. nvim), so the
++            // viewport isn't moving and must not be shifted.
++            if (self.io.terminal.flags.mouse_event != .none) break :offset 0;
++
++            // Don't shift past the ends of the scrollback: there is no
++            // content there to scroll into view.
++            const pages = &self.io.terminal.screens.active.pages;
++            const top_left = pages.getTopLeft(.viewport);
++            if (pending > 0 and top_left.up(1) == null) break :offset 0;
++            if (pending < 0 and pages.pinIsActive(top_left)) break :offset 0;
++
++            break :offset pending;
++        };
++
+         // If we're in alternate screen with alternate scroll enabled, then
+         // we convert to cursor keys. This only happens if we're:
+         // (1) alt screen (2) no explicit mouse reporting and (3) alt
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 1337c5154..cb6e4a058 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -766,6 +766,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     .foreground_color = @splat(0),
+                     .cursor_color = @splat(0),
+                     .cursor_text = @splat(0),
++                    .pending_scroll = @splat(0),
+                     .selection_background_color = @splat(0),
+                     .selection_foreground_color = @splat(0),
+                 },
+@@ -2144,6 +2145,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+ 
+             uniforms.frame += 1;
+ 
++            // Sub-cell scroll offset for smooth scrolling shaders. The value
++            // is computed on the app thread under the renderer lock (see
++            // Surface.scrollCallback); we only read the scalar here.
++            {
++                const surface: *Surface = @fieldParentPtr("renderer", self);
++                uniforms.pending_scroll = .{
++                    0,
++                    @floatCast(surface.mouse.smooth_scroll_y),
++                };
++            }
++
+             const screen = self.size.screen;
+             const padding = self.size.padding;
+             const cell = self.size.cell;
+diff --git a/src/renderer/shaders/shadertoy_prefix.glsl b/src/renderer/shaders/shadertoy_prefix.glsl
+index 4b6d091b8..2bf1d7d6b 100644
+--- a/src/renderer/shaders/shadertoy_prefix.glsl
++++ b/src/renderer/shaders/shadertoy_prefix.glsl
+@@ -28,6 +28,7 @@ layout(binding = 1, std140) uniform Globals {
+     uniform vec3  iCursorText;
+     uniform vec3  iSelectionForegroundColor;
+     uniform vec3  iSelectionBackgroundColor;
++    uniform vec2  iPendingScroll;
+ };
+ 
+ #define CURSORSTYLE_BLOCK        0
+diff --git a/src/renderer/shadertoy.zig b/src/renderer/shadertoy.zig
+index 6dee18b04..050a6c51a 100644
+--- a/src/renderer/shadertoy.zig
++++ b/src/renderer/shadertoy.zig
+@@ -39,6 +39,8 @@ pub const Uniforms = extern struct {
+     cursor_text: [4]f32 align(16),
+     selection_background_color: [4]f32 align(16),
+     selection_foreground_color: [4]f32 align(16),
++    /// Sub-cell scroll offset in pixels, for smooth scrolling shaders.
++    pending_scroll: [2]f32 align(8),
+ };
+ 
+ /// The target to load shaders for.
+diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
+index 429a3633b..92268fb03 100644
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -5575,7 +5575,7 @@ pub fn nodeIsValid(
+ 
+ /// Returns the viewport for the given pin, preferring to pin to
+ /// "active" if the pin is within the active area.
+-fn pinIsActive(self: *const PageList, p: Pin) bool {
++pub fn pinIsActive(self: *const PageList, p: Pin) bool {
+     // If the pin is in the active page, then we can quickly determine
+     // if we're beyond the end.
+     const active = self.getTopLeft(.active);
+-- 
+2.50.1 (Apple Git-155)
+

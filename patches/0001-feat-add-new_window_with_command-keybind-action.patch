@@ -1,0 +1,357 @@
+From 816ff39f94f736e8ae63986a92fde1b60c9001c7 Mon Sep 17 00:00:00 2001
+From: Aman <3285444+realav@users.noreply.github.com>
+Date: Mon, 10 Aug 2026 14:01:39 +0530
+Subject: [PATCH 1/3] feat: add new_window_with_command keybind action
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream has no keybind action that can open a window running a specific
+command. `new_window` takes no argument, and while `ghostty +new-window`
+does accept `--command`, it is Linux-only: the macOS apprt returns false
+for every IPC action.
+
+That leaves `text:`-based workarounds as the only option on macOS, which
+only work when a shell is reading the surface — a full-screen TUI simply
+swallows the key.
+
+This adds:
+
+    keybind = cmd+escape=new_window_with_command:claude
+
+The command overrides the `command` config for the new window's first
+surface only; working directory inheritance and focus behavior match
+`new_window`. It resolves inside libghostty's binding layer, so it fires
+regardless of what is running in the focused surface.
+
+Implemented additively — no existing type or behavior is modified — to
+keep rebases against upstream main quiet.
+---
+ include/ghostty.h                          |  8 +++++
+ macos/Sources/Ghostty/Ghostty.Action.swift | 14 +++++++++
+ macos/Sources/Ghostty/Ghostty.App.swift    | 36 ++++++++++++++++++++--
+ src/App.zig                                | 19 ++++++++++++
+ src/Surface.zig                            |  5 +++
+ src/apprt/action.zig                       | 29 +++++++++++++++++
+ src/apprt/gtk/class/application.zig        | 20 ++++++++++++
+ src/input/Binding.zig                      | 13 ++++++++
+ src/input/command.zig                      |  1 +
+ 9 files changed, 142 insertions(+), 3 deletions(-)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index a14e2dcb6..343e2e1fd 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -828,6 +828,12 @@ typedef struct {
+   uintptr_t len;
+ } ghostty_action_open_url_s;
+ 
++// apprt.action.NewWindowCommand.C
++typedef struct {
++  const char* command;
++  uintptr_t len;
++} ghostty_action_new_window_command_s;
++
+ // apprt.action.CloseTabMode
+ typedef enum {
+   GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS,
+@@ -958,6 +964,7 @@ typedef enum {
+   GHOSTTY_ACTION_READONLY,
+   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
++  GHOSTTY_ACTION_NEW_WINDOW_WITH_COMMAND,
+ } ghostty_action_tag_e;
+ 
+ typedef union {
+@@ -1000,6 +1007,7 @@ typedef union {
+   ghostty_action_search_total_s search_total;
+   ghostty_action_search_selected_s search_selected;
+   ghostty_action_readonly_e readonly;
++  ghostty_action_new_window_command_s new_window_with_command;
+ } ghostty_action_u;
+ 
+ typedef struct {
+diff --git a/macos/Sources/Ghostty/Ghostty.Action.swift b/macos/Sources/Ghostty/Ghostty.Action.swift
+index f1df63133..fe833cfb3 100644
+--- a/macos/Sources/Ghostty/Ghostty.Action.swift
++++ b/macos/Sources/Ghostty/Ghostty.Action.swift
+@@ -77,6 +77,20 @@ extension Ghostty.Action {
+         }
+     }
+ 
++    struct NewWindowCommand {
++        /// The command to run in the new window's first surface.
++        let command: String
++
++        init(c: ghostty_action_new_window_command_s) {
++            if let commandCString = c.command {
++                let data = Data(bytes: commandCString, count: Int(c.len))
++                self.command = String(data: data, encoding: .utf8) ?? ""
++            } else {
++                self.command = ""
++            }
++        }
++    }
++
+     struct ProgressReport {
+         enum State {
+             case remove
+diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
+index 1e02c8c57..1a9d728d4 100644
+--- a/macos/Sources/Ghostty/Ghostty.App.swift
++++ b/macos/Sources/Ghostty/Ghostty.App.swift
+@@ -502,6 +502,15 @@ extension Ghostty {
+             case GHOSTTY_ACTION_NEW_WINDOW:
+                 newWindow(app, target: target)
+ 
++            case GHOSTTY_ACTION_NEW_WINDOW_WITH_COMMAND:
++                newWindow(
++                    app,
++                    target: target,
++                    command: Ghostty.Action.NewWindowCommand(
++                        c: action.action.new_window_with_command
++                    ).command
++                )
++
+             case GHOSTTY_ACTION_NEW_TAB:
+                 newTab(app, target: target)
+ 
+@@ -827,23 +836,44 @@ extension Ghostty {
+             return true
+         }
+ 
+-        private static func newWindow(_ app: ghostty_app_t, target: ghostty_target_s) {
++        /// Open a new window. If `command` is non-empty, the new window's first
++        /// surface runs that command instead of the configured `command`.
++        private static func newWindow(
++            _ app: ghostty_app_t,
++            target: ghostty_target_s,
++            command: String = ""
++        ) {
+             switch target.tag {
+             case GHOSTTY_TARGET_APP:
++                // With no parent surface there's nothing to inherit, so we only
++                // need a config at all when we're overriding the command.
++                var userInfo: [String: Any] = [:]
++                if !command.isEmpty {
++                    var config = SurfaceConfiguration()
++                    config.command = command
++                    userInfo[Notification.NewSurfaceConfigKey] = config
++                }
++
+                 NotificationCenter.default.post(
+                     name: Notification.ghosttyNewWindow,
+                     object: nil,
+-                    userInfo: [:]
++                    userInfo: userInfo
+                 )
+ 
+             case GHOSTTY_TARGET_SURFACE:
+                 guard let surface = target.target.surface else { return }
+                 guard let surfaceView = self.surfaceView(from: surface) else { return }
++                var config = SurfaceConfiguration(
++                    from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_WINDOW))
++                if !command.isEmpty {
++                    config.command = command
++                }
++
+                 NotificationCenter.default.post(
+                     name: Notification.ghosttyNewWindow,
+                     object: surfaceView,
+                     userInfo: [
+-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_WINDOW)),
++                        Notification.NewSurfaceConfigKey: config,
+                     ]
+                 )
+ 
+diff --git a/src/App.zig b/src/App.zig
+index 28bbd83f1..ad016376c 100644
+--- a/src/App.zig
++++ b/src/App.zig
+@@ -323,6 +323,17 @@ pub fn newWindow(self: *App, rt_app: *apprt.App, msg: Message.NewWindow) !void {
+         break :target .app;
+     };
+ 
++    // A command override needs a different action so the apprt can pass the
++    // command through to the new surface's configuration.
++    if (msg.command.len > 0) {
++        _ = try rt_app.performAction(
++            target,
++            .new_window_with_command,
++            .{ .command = msg.command },
++        );
++        return;
++    }
++
+     _ = try rt_app.performAction(
+         target,
+         .new_window,
+@@ -451,6 +462,10 @@ pub fn performAction(
+         .ignore => {},
+         .quit => _ = try rt_app.performAction(.app, .quit, {}),
+         .new_window => _ = try self.newWindow(rt_app, .{ .parent = null }),
++        .new_window_with_command => |command| _ = try self.newWindow(rt_app, .{
++            .parent = null,
++            .command = command,
++        }),
+         .open_config => _ = try rt_app.performAction(.app, .open_config, {}),
+         .reload_config => _ = try rt_app.performAction(.app, .reload_config, .{}),
+         .close_all_windows => _ = try rt_app.performAction(.app, .close_all_windows, {}),
+@@ -580,6 +595,10 @@ pub const Message = union(enum) {
+     const NewWindow = struct {
+         /// The parent surface
+         parent: ?*Surface = null,
++
++        /// If set, the new window's first surface runs this command instead
++        /// of the configured `command`. Empty means "use the default".
++        command: []const u8 = "",
+     };
+ };
+ 
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 3002e9f58..79c2a53db 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -4821,6 +4821,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+                 .{ .parent = self },
+             ),
+ 
++            .new_window_with_command => |command| try self.app.newWindow(
++                self.rt_app,
++                .{ .parent = self, .command = command },
++            ),
++
+             // Undo and redo both support both surface and app targeting.
+             // If we are triggering on a surface then we perform the
+             // action with the surface target.
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index 12a4163fd..e00d6a944 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -354,6 +354,12 @@ pub const Action = union(Key) {
+     /// Move a tab to a new window.
+     move_tab_to_new_window,
+ 
++    /// Open a new window whose first surface runs a specific command,
++    /// overriding the `command` configuration for that window only. The
++    /// target determines whether properties such as the working directory
++    /// should be inherited.
++    new_window_with_command: NewWindowCommand,
++
+     /// Sync with: ghostty_action_tag_e
+     pub const Key = enum(c_int) {
+         quit,
+@@ -424,6 +430,7 @@ pub const Action = union(Key) {
+         readonly,
+         copy_title_to_clipboard,
+         move_tab_to_new_window,
++        new_window_with_command,
+ 
+         test "ghostty.h Action.Key" {
+             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
+@@ -971,6 +978,28 @@ pub const OpenUrl = struct {
+     }
+ };
+ 
++/// The command to run in a newly opened window. See the `new_window_with_command`
++/// action.
++pub const NewWindowCommand = struct {
++    /// The command line to run. This is not null-terminated; use `len`.
++    /// It is owned by the configuration that produced the keybinding, so it
++    /// is only valid for the duration of the action call.
++    command: []const u8,
++
++    // Sync with: ghostty_action_new_window_command_s
++    pub const C = extern struct {
++        command: [*]const u8,
++        len: usize,
++    };
++
++    pub fn cval(self: NewWindowCommand) C {
++        return .{
++            .command = self.command.ptr,
++            .len = self.command.len,
++        };
++    }
++};
++
+ /// sync with ghostty_action_close_tab_mode_e in ghostty.h
+ pub const CloseTabMode = enum(c_int) {
+     /// Close the current tab.
+diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
+index 7804366f5..4bf056fc2 100644
+--- a/src/apprt/gtk/class/application.zig
++++ b/src/apprt/gtk/class/application.zig
+@@ -738,6 +738,26 @@ pub const Application = extern struct {
+                 .none,
+             ),
+ 
++            .new_window_with_command => {
++                // `Command.shell` needs a sentinel-terminated string but the
++                // keybinding gives us a plain slice. `newWindow` copies what
++                // it needs before returning (same as `actionNewWindow`), so a
++                // temporary allocation is enough.
++                var arena: std.heap.ArenaAllocator = .init(self.core().alloc);
++                defer arena.deinit();
++
++                try Action.newWindow(
++                    self,
++                    switch (target) {
++                        .app => null,
++                        .surface => |v| v,
++                    },
++                    .{ .command = .{
++                        .shell = try arena.allocator().dupeZ(u8, value.command),
++                    } },
++                );
++            },
++
+             .open_config => return Action.openConfig(self),
+ 
+             .open_url => Action.openUrl(self, value),
+diff --git a/src/input/Binding.zig b/src/input/Binding.zig
+index 35fd7b8cc..c5a3ff77f 100644
+--- a/src/input/Binding.zig
++++ b/src/input/Binding.zig
+@@ -556,6 +556,18 @@ pub const Action = union(enum) {
+     /// this will bring it to the front.
+     new_window,
+ 
++    /// Open a new window running a specific command, overriding the
++    /// `command` configuration for that window only.
++    ///
++    /// The value is parsed exactly like the `command` configuration:
++    /// it is run through the shell, so shell syntax works. Example:
++    ///
++    ///     keybind = cmd+escape=new_window_with_command:claude
++    ///
++    /// Everything else (working directory inheritance, focus behavior)
++    /// matches `new_window`.
++    new_window_with_command: []const u8,
++
+     /// Open a new tab.
+     new_tab,
+ 
+@@ -1350,6 +1362,7 @@ pub const Action = union(enum) {
+ 
+             // These are app but can be special-cased in a surface context.
+             .new_window,
++            .new_window_with_command,
+             .undo,
+             .redo,
+             => .app,
+diff --git a/src/input/command.zig b/src/input/command.zig
+index 6560148bc..1a505f735 100644
+--- a/src/input/command.zig
++++ b/src/input/command.zig
+@@ -703,6 +703,7 @@ fn actionCommands(action: Action.Key) []const Command {
+         .csi,
+         .esc,
+         .cursor_key,
++        .new_window_with_command,
+         .set_font_size,
+         .set_surface_title,
+         .set_tab_title,
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,117 @@
+name: Build patched Ghostty (macOS arm64)
+
+# Clones upstream Ghostty at the pinned commit, applies patches/*.patch, builds
+# the macOS app and uploads it as an artifact. None of Ghostty's history lives
+# in this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ghostty ref to build (blank = use .fork-base)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+jobs:
+  build:
+    runs-on: macos-15 # arm64, free and unlimited on public repos
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner ships ~14 GB free. Spare Xcodes and simulator runtimes are
+      # the cheapest space to reclaim. Every step prints df, so a disk failure
+      # says exactly where it happened instead of leaving us guessing.
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          KEEP=$(xcode-select -p | sed 's|/Contents/Developer||')
+          echo "keeping $KEEP"
+          for app in /Applications/Xcode*.app; do
+            [ "$app" = "$KEEP" ] || sudo rm -rf "$app"
+          done
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Profiles/Runtimes
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes
+          echo "after cleanup:"; df -h / | tail -1
+
+      # Manual run: use the given ref, else the pin in .fork-base.
+      # Scheduled run: follow upstream main, so new commits are picked up
+      # without touching this repo. If the patches stop applying, `git am`
+      # fails loudly and that failure is the signal to refresh them.
+      - name: Resolve ref
+        id: ref
+        run: |
+          REF="${{ inputs.ref }}"
+          if [ -z "$REF" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            REF=main
+          fi
+          [ -n "$REF" ] || REF=$(cat .fork-base)
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "building $REF"
+
+      - name: Clone Ghostty and apply patches
+        run: |
+          # A pinned SHA can't be cloned with --branch, so fetch it directly.
+          git init -q ghostty && cd ghostty
+          git remote add origin https://github.com/ghostty-org/ghostty.git
+          git fetch -q --depth 1 origin "${{ steps.ref.outputs.ref }}"
+          git checkout -q FETCH_HEAD
+          git config user.email ci@example.com
+          git config user.name "fork ci"
+          git am ../patches/*.patch
+          git log --oneline -4
+          echo "SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          df -h / | tail -1
+
+      # Pin to the version upstream declares, so a Zig bump upstream doesn't
+      # silently build against the wrong compiler.
+      - name: Resolve required Zig version
+        id: zig
+        run: |
+          V=$(sed -n -E 's/^[[:space:]]*\.?minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' ghostty/build.zig.zon)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "zig $V"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # Xcode 26 ships the Metal compiler separately; Ghostty compiles shaders.
+      - name: Ensure Metal toolchain
+        run: |
+          xcrun metal --version 2>/dev/null || xcodebuild -downloadComponent MetalToolchain
+          xcrun metal --version 2>&1 | head -2
+          df -h / | tail -1
+
+      # -Dxcframework-target=native builds only the arm64 macOS slice. The
+      # default (universal) also builds x86_64, iOS and the iOS simulator,
+      # which multiplies build time and cache size several times over for
+      # slices we never run.
+      - name: Build
+        run: |
+          cd ghostty
+          zig build -Doptimize=ReleaseFast -Dxcframework-target=native
+          test -d macos/build/ReleaseLocal/Ghostty.app || {
+            echo "build produced no app bundle"; exit 1; }
+          echo "cache size:"; du -sh .zig-cache || true
+          df -h / | tail -1
+
+      # Ad-hoc signed here on purpose: the signing certificate stays on the
+      # local machine and never enters CI. local/install.sh re-signs on
+      # download, which is what keeps macOS permission grants from being
+      # thrown away on every build. See README.
+      - name: Package
+        run: |
+          ditto -c -k --keepParent \
+            ghostty/macos/build/ReleaseLocal/Ghostty.app \
+            "$RUNNER_TEMP/Ghostty-$SHA.zip"
+          ls -lh "$RUNNER_TEMP"/Ghostty-*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ghostty-${{ env.SHA }}-patched-arm64
+          path: ${{ runner.temp }}/Ghostty-*.zip
+          retention-days: 30
