@@ -14,9 +14,11 @@ Same shape as [zed-fork-ci](https://github.com/realav/zed-fork-ci).
 | `.fork-base`                      | Upstream commit the patches are known to apply to        |
 | `.github/workflows/build-mac.yml` | Clone upstream → apply patches → build → upload artifact |
 | `local/install.sh`                | Download the latest build, re-sign, install              |
-| `local/make-patches.sh`           | Regenerate `patches/` from a local fork checkout         |
+| `local/refresh-patches.sh`        | Rebase patches onto newer upstream and re-export          |
 | `local/make-signing-cert.sh`      | Create the local signing certificate (run once)          |
 | `local/smoothscroll.glsl`         | Shader for the smooth-scrolling patch                    |
+| `local/build-local.sh`            | Build locally instead of in CI (needs a checkout)         |
+| `local/FORK.md`                   | Fuller notes on the patches and their rationale           |
 
 ## Install a build
 

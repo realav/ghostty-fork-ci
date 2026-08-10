@@ -1,4 +1,4 @@
-From 5934da8ec61697fc832924093ec6228a331358d4 Mon Sep 17 00:00:00 2001
+From 19026c37ab46af4f5c9aae53005280101f0e5f96 Mon Sep 17 00:00:00 2001
 From: Aman <3285444+realav@users.noreply.github.com>
 Date: Mon, 10 Aug 2026 14:01:39 +0530
 Subject: [PATCH 2/3] feat: add new_tab_with_command keybind action
@@ -27,10 +27,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  8 files changed, 84 insertions(+), 16 deletions(-)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 343e2e1fd..e8f7182bf 100644
+index c140ac9df..ba642596a 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -828,11 +828,11 @@ typedef struct {
+@@ -832,11 +832,11 @@ typedef struct {
    uintptr_t len;
  } ghostty_action_open_url_s;
  
@@ -44,7 +44,7 @@ index 343e2e1fd..e8f7182bf 100644
  
  // apprt.action.CloseTabMode
  typedef enum {
-@@ -965,6 +965,7 @@ typedef enum {
+@@ -969,6 +969,7 @@ typedef enum {
    GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
    GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
    GHOSTTY_ACTION_NEW_WINDOW_WITH_COMMAND,
@@ -52,7 +52,7 @@ index 343e2e1fd..e8f7182bf 100644
  } ghostty_action_tag_e;
  
  typedef union {
-@@ -1007,7 +1008,8 @@ typedef union {
+@@ -1011,7 +1012,8 @@ typedef union {
    ghostty_action_search_total_s search_total;
    ghostty_action_search_selected_s search_selected;
    ghostty_action_readonly_e readonly;

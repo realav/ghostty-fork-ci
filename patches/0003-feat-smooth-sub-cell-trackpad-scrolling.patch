@@ -1,4 +1,4 @@
-From e5d4ee6c06f1a73552ed8d334c92d1b47adafa41 Mon Sep 17 00:00:00 2001
+From 815592e1982eff10a6cd996ad6cfedec8d06c713 Mon Sep 17 00:00:00 2001
 From: Aman <3285444+realav@users.noreply.github.com>
 Date: Mon, 10 Aug 2026 14:01:39 +0530
 Subject: [PATCH 3/3] feat: smooth (sub-cell) trackpad scrolling
