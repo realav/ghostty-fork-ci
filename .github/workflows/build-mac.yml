@@ -22,18 +22,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ghostty main builds against the macOS 26 SDK, and the runner's default
-      # Xcode selection can be older (a macos-15 image selects 16.4, which fails
-      # compiling the Swift targets). Pick the newest Xcode explicitly and only
-      # then delete the others — deleting first throws away the one we needed.
+      # Ghostty main builds against the macOS 26 SDK, so pick the newest Xcode
+      # explicitly rather than trusting the image default.
       #
-      # Spare Xcodes and simulator runtimes are the cheapest space to reclaim on
-      # a runner with ~14 GB free. Every step prints df, so a disk failure says
-      # exactly where it happened instead of leaving us guessing.
-      - name: Select Xcode and free disk space
+      # Deliberately does NOT delete the other Xcodes. The image ships ~15
+      # bundles that share storage (Xcode_26.6.app and Xcode_26.6.0.app are one
+      # install), so deleting "the others" destroys the selected one and
+      # xcode-select silently falls back to CommandLineTools. There is also no
+      # need: this runner has ~97 GB free and the native-slice build uses a
+      # small fraction of it.
+      - name: Select Xcode
         run: |
           df -h / | tail -1
-          ls -d /Applications/Xcode*.app || true
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$NEWEST" ] || { echo "no Xcode on this runner"; exit 1; }
           echo "selecting $NEWEST"
@@ -44,12 +44,6 @@ jobs:
             echo "Xcode $MAJOR is too old; Ghostty main needs the macOS 26 SDK." >&2
             exit 1
           fi
-          for app in /Applications/Xcode*.app; do
-            [ "$app" = "$NEWEST" ] || sudo rm -rf "$app"
-          done
-          sudo rm -rf ~/Library/Developer/CoreSimulator/Profiles/Runtimes
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes
-          echo "after cleanup:"; df -h / | tail -1
 
       # Manual run: use the given ref, else the pin in .fork-base.
       # Scheduled run: follow upstream main, so new commits are picked up
